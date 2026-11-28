@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mm_fm6_tables.h"
 
 /* ---- tables (the device's formulas; MOD3_T_* by id, the rest the part's own) */
 static int16_t T_SINE[1025], T_TANH[257];
@@ -16,11 +17,14 @@ static uint16_t T_SVF_G[128];
 static uint32_t T_PITCH_OCT[192], T_A4_RATIO[81];
 static int32_t T_A4_LOG[81];
 static float T_P5_TANH[1025];
+static float T_FM6_SIN[1025];                    /* (FM6 and CZ-1's: the device's, mm_fm6_tables.h) */
+static uint16_t T_FM6_MKI_LOG[1024], T_FM6_MKI_EXP[1024], T_FM6_OPL_LOG[256], T_FM6_OPL_EXP[256];
 static uint32_t ENV_LIN[128], LFO_INC[128];
 static uint16_t ENV_EXP[128];
 
 static void tables_make(void)
 {
+    mm_fm6_tables(T_FM6_SIN, T_FM6_MKI_LOG, T_FM6_MKI_EXP, T_FM6_OPL_LOG, T_FM6_OPL_EXP);
     for (int i = 0; i < 1025; i++)
         T_SINE[i] = (int16_t)nearbyint(32767.0 * sin(2.0 * M_PI * i / 1024.0));
     for (int i = 0; i < 257; i++)
@@ -111,7 +115,12 @@ static const void *h_table(uint32_t id)
     case MOD3_T_A4_RATIO: return T_A4_RATIO;
     case MOD3_T_A4_LOG: return T_A4_LOG;
     case MOD3_T_P5_TANH: return T_P5_TANH;
-    default: return 0;                           /* (FM6's tables: not here) */
+    case MOD3_T_FM6_SIN: return T_FM6_SIN;
+    case MOD3_T_FM6_MKI_LOG: return T_FM6_MKI_LOG;
+    case MOD3_T_FM6_MKI_EXP: return T_FM6_MKI_EXP;
+    case MOD3_T_FM6_OPL_LOG: return T_FM6_OPL_LOG;
+    case MOD3_T_FM6_OPL_EXP: return T_FM6_OPL_EXP;
+    default: return 0;
     }
 }
 static mm_part *h_part_of(uint32_t k) { return h_cur && k == h_cur->h.index ? h_cur : 0; }
@@ -280,6 +289,8 @@ int mm_part_open(mm_part *t, const mod_desc_v3 *d, const mod_engine_v3 *e)
     for (uint32_t i = 0; i < MOD3_NVOICE; i++)
         t->v[i].h.index = (uint8_t)i;
     t->bend_semis = 2;
+    t->vel_amp = MM_VEL_DEF;
+    t->at_flt = MM_ATFLT_DEF;
     t->bpm = 120.0;
     t->seed = 0x1234567u;
     t->lfo_fade = 32767;
@@ -497,6 +508,7 @@ static void voice_start(mm_part *t, mm_voice *v, uint32_t note, uint32_t vel, ui
     if (!sounding) {
         h->env = 0;
         h->env_out = 0;
+        v->at_q15 = 0;
         v->side = t->sp_alt;
         t->sp_alt ^= 1u;
     }
@@ -594,6 +606,7 @@ void mm_note_on(mm_part *t, uint32_t note, uint32_t vel)
     }
     vel = vel > 127u ? 127u : vel;
     t->held[note] = 1;
+    t->key_at[note] = 0;                         /* a key pressed again: no pressure yet */
     for (i = 0; i < MOD3_NVOICE; i++)
         any |= t->v[i].h.gate;
     if (!any) {                                  /* a fresh phrase: LFO retrigger (TRIG NOTE) and fade */
@@ -709,6 +722,22 @@ void mm_kill(mm_part *t)
 
 void mm_bend(mm_part *t, int32_t raw) { t->h.bend_raw = (int16_t)clamp(raw, -8192, 8191); }
 
+void mm_pressure(mm_part *t, int32_t note, uint32_t value)
+{
+    uint32_t top;
+    value = value > 127u ? 127u : value;
+    if (note < 0)
+        t->chan_at = (uint8_t)value;
+    else if (note < 128)
+        t->key_at[note] = (uint8_t)value;
+    /* the part's (mod_part_v3.at, what a module reads): the channel's, or the hardest pressed of the keys held */
+    top = t->chan_at;
+    for (uint32_t n = 0; n < 128u; n++)
+        if (t->held[n] && t->key_at[n] > top)
+            top = t->key_at[n];
+    t->h.at = (uint8_t)top;
+}
+
 int mm_live(const mm_part *t)
 {
     for (uint32_t i = 0; i < MOD3_NVOICE; i++)
@@ -801,6 +830,15 @@ static int32_t env_tick(mm_part *t, mm_voice *v)
     return h->env >> 9;
 }
 
+/* VEL: the level of velocity vel (1..127), Q15: 1 - VEL x (1 - vel / 127); at 127 vel x 258 (the FM-1's), at 0 32767
+ * (the level as it is) */
+static int32_t vel_gain(const mm_part *t, uint32_t vel)
+{
+    uint32_t d = (uint32_t)clamp(t->vel_amp, 0, 127);
+    vel = vel > 127u ? 127u : vel;
+    return d ? 32766 - (int32_t)((127u - vel) * 258u * d / 127u) : 32767;
+}
+
 int mm_tick(mm_part *t, int32_t *out)
 {
     const mod_engine_v3 *e = t->e;
@@ -842,7 +880,7 @@ int mm_tick(mm_part *t, int32_t *out)
         mm_voice *v = &t->v[i];
         mod_voice_v3 *h = &v->h;
         mod_vmod_v3 m;
-        int32_t env, pitch;
+        int32_t env, pitch, vg;
         if (!h->active)
             continue;
         env = env_tick(t, v);
@@ -862,7 +900,8 @@ int mm_tick(mm_part *t, int32_t *out)
         m.envq15 = e->ownenv ? 0 : env;
         if (e->env_q15)
             m.envq15 = e->env_q15(&t->h, h);
-        m.amp1 = e->ownenv ? env : mulq15(env, h->vel * 258);
+        vg = vel_gain(t, h->vel);                /* (an engine with its own envelopes too: its env is 32767 here) */
+        m.amp1 = vg < 32767 ? mulq15(env, vg) : env;
         if (p[MM_P_LD_AMP])
             m.amp1 = mulq15(m.amp1, 32767 - mulq15(p[MM_P_LPOL] ? lfo : (lfo + 32768) >> 1, p[MM_P_LD_AMP] * 258));
         m.amp0 = h->env_out;
@@ -885,6 +924,12 @@ int mm_tick(mm_part *t, int32_t *out)
         m.cutoff = ((lfo * p[MM_P_LD_FLT]) >> 7) + ((m.envq15 * p[MM_P_ED_FLT]) >> 7);
         if (h->vel > 110)                        /* accent opens the filter with the envelope */
             m.cutoff += (m.envq15 * 24) >> 7;
+        {                                        /* AT FLT: its key's pressure (or the channel's), ~3 ms to get there */
+            uint32_t a = t->key_at[h->note] > t->chan_at ? t->key_at[h->note] : t->chan_at;
+            v->at_q15 += ((int32_t)a * 258 - v->at_q15) >> 2;
+            if (t->at_flt)
+                m.cutoff = clamp(m.cutoff + ((v->at_q15 * t->at_flt) >> 7), -150 * 256, 150 * 256);
+        }
         m.shape = (64 << 8) + ((lfo * p[MM_P_LD_SHP]) >> 7) + ((m.envq15 * p[MM_P_ED_SHP]) >> 7);
         if (e->menv)
             m.envq15 = e->menv(&t->h, h);

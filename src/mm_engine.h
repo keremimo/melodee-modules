@@ -11,6 +11,9 @@
 #define MM_CTL MOD3_CTL
 #define MM_FS MOD3_RATE
 #define MM_NPOLY 8u                              /* POLY's voices when the engine names none */
+#define MM_VEL_DEF 127                           /* VEL as a new part has it: the level follows velocity (the FM-1's) */
+#define MM_ATFLT_DEF 32                          /* AT FLT as a new part has it: full pressure opens the filter by a
+                                                  * quarter of its range */
 
 /* the part's parameters by P_* number (frozen by ABI 3: mod_part_v3.p) */
 enum {
@@ -30,6 +33,7 @@ typedef struct mm_voice {
     mod_voice_v3 h;                              /* what the module reads (first) */
     int32_t fine;                                /* UNISON's detune, 1/4096 */
     int32_t gstep;                               /* glide TIME's step, 1/16 semitone a block */
+    int32_t at_q15;                              /* its key's pressure as the filter hears it (smoothed), Q15 */
     uint8_t side, rsv[3];
 } mm_voice;
 
@@ -42,6 +46,10 @@ typedef struct mm_part {
     int32_t lfo_val, lfo_fade;
     int32_t bend_q8;                             /* the bend as it glides to its target, Q8 semitones */
     int32_t bend_semis;                          /* the wheel's range when the engine names none */
+    int32_t vel_amp;                             /* VEL: how far the level follows velocity, 0..127 (127: as the FM-1) */
+    int32_t at_flt;                              /* AT FLT: pressure to the filter, -64..63 (as ENV FLT) */
+    uint8_t chan_at;                             /* the channel's pressure (channel aftertouch), 0..127 */
+    uint8_t key_at[128];                         /* each key's pressure (poly aftertouch) since it was pressed */
     double bpm, lfo_sync_frac;                   /* LFO SYNC: the host's tempo */
     uint8_t mono_note, rr, sp_alt, in_post, stereo_used, sustain;
     uint8_t held[128];                           /* keys down (1) and keys the pedal holds (2) */
@@ -76,6 +84,8 @@ void mm_sustain(mm_part *t, int down);
 void mm_all_off(mm_part *t);                     /* release every voice */
 void mm_kill(mm_part *t);                        /* silence at once (reset) */
 void mm_bend(mm_part *t, int32_t raw);           /* -8192..8191 */
+/* pressure (0..127): poly aftertouch for the voices playing key note, or note -1 the channel's (every voice) */
+void mm_pressure(mm_part *t, int32_t note, uint32_t value);
 /* host 2: the part's patch replaced by len bytes (the rest of it 0), the module told how (MOD3_PATCH_*) */
 void mm_patch_set(mm_part *t, const uint8_t *patch, uint32_t len, uint32_t how);
 /* host 2: the module told its patch changed (MOD3_PATCH_*, a parameter's id; 0xFFFF several) */

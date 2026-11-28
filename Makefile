@@ -3,13 +3,14 @@
 # and the host test (make test: the plug-in with tests/fixtures/*.mmod in its Modules folder). make dist puts the MPC
 # build in dist/ as "Melodee Modules/Melodee Modules.clap" beside empty Modules and SysEx folders. Synth modules are the
 # firmware's build outputs, never in this repository: make fixtures builds the test modules from a Melodee firmware
-# checkout (FIRMWARE) with mod_build.py --native, into tests/fixtures (ignored).
+# checkout (FIRMWARE) with mod_build.py --native, into tests/fixtures (ignored), and the firmware's engine-source synths
+# into tests/fixtures/synths (ignored), which only make test-each loads.
 CC ?= cc
 OUT ?= build/$(shell uname -s)-$(shell uname -m)
 NAME = melodee-modules.clap
 CFLAGS ?= -O2
-MM_CFLAGS = -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror -Isdk -Isrc -Ithird_party/clap
-LIBS = -lm
+MM_CFLAGS = -std=gnu11 -fPIC -fvisibility=hidden -pthread -Wall -Wextra -Werror -Isdk -Isrc -Ithird_party/clap
+LIBS = -lm -pthread
 ifeq ($(shell uname -s),Darwin)
 SHARED = -dynamiclib
 else
@@ -17,9 +18,13 @@ SHARED = -shared -Wl,--no-undefined -Wl,-z,defs
 endif
 
 FIRMWARE ?= ../Felucca
-SRC = src/mm_engine.c src/mm_file.c src/mm_image.c src/mm_plugin.c src/mm_resample.c src/mm_schema.c src/mm_sign.c
+SRC = src/mm_draw.c src/mm_engine.c src/mm_file.c src/mm_font.c src/mm_image.c src/mm_plugin.c src/mm_resample.c src/mm_schema.c \
+      src/mm_screen.c src/mm_sign.c src/mm_watch.c
 OBJ = $(SRC:%.c=$(OUT)/obj/%.o)
 FIXTURES = $(wildcard tests/fixtures/*.mmod)
+# the firmware's engine-source synths (SID, CZ-1, FM6, the Prophet): each alone in test-each (their AA64 code carries
+# its own tables; files built before 2026-11-27's firmware took them from the host table)
+SYNTHS = $(wildcard tests/fixtures/synths/*.mmod)
 
 all: $(OUT)/$(NAME)
 
@@ -49,7 +54,7 @@ test: $(OUT)/$(NAME) $(OUT)/test_host
 # each module file alone in a Modules folder; two staged copies of the plug-in beside a linked Modules folder
 test-each: $(OUT)/$(NAME) $(OUT)/test_host
 	@test -n "$(FIXTURES)" || $(NO_FIXTURES)
-	@for f in $(FIXTURES); do \
+	@for f in $(FIXTURES) $(SYNTHS); do \
 		rm -rf $(OUT)/one && mkdir -p $(OUT)/one/Modules && cp $(OUT)/$(NAME) $(OUT)/one/ && cp $$f $(OUT)/one/Modules/ && \
 		$(OUT)/test_host --one $(OUT)/one/$(NAME) || exit 1; done
 
@@ -67,7 +72,11 @@ fixtures:
 	cd $(FIRMWARE) && for m in hydra ppg; do \
 		python3 firmware/modules/sdk/mod_build.py --native build/modules/outside/$$m.mmod --src outside/$$m/$$m.c \
 		-o $(CURDIR)/tests/fixtures/$$m.mmod || exit 1; done
-	rm -rf tests/fixtures/.mod_native
+	mkdir -p tests/fixtures/synths
+	cd $(FIRMWARE) && for m in sid cz fm6 prophet; do \
+		python3 firmware/modules/sdk/mod_build.py --native build/modules/$$m.mmod \
+		-o $(CURDIR)/tests/fixtures/synths/$$m.mmod || exit 1; done
+	rm -rf tests/fixtures/.mod_native tests/fixtures/synths/.mod_native
 
 # Linux aarch64 for the MPC Sample (glibc 2.36, GCC 12: older than the MPC's 2.39 / 13), tested there as on the Mac
 mpc:
